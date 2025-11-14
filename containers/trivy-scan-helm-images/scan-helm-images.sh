@@ -227,8 +227,8 @@ for img in "${images[@]}"; do
 done
 
 if [[ "$GENERATE_SBOM_REPORTS" == true ]]; then
-    echo "Generating SBOM summary reports..."
-    ./generate-sbom-summary-reports.sh "$OUTPUT_DIR"
+  echo "Generating SBOM summary reports..."
+  "$(dirname "$0")/generate-sbom-summary-reports.sh" "$OUTPUT_DIR"
 fi
 
 echo "All done! Reports are in $OUTPUT_DIR"
