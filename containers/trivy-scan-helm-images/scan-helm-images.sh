@@ -18,6 +18,7 @@ RELEASE_NAME="myrelease"
 NAMESPACE="default"
 OUTPUT_DIR="./trivy-reports"
 TRIVY_CACHE_DIR="${HOME}/.cache/trivy"
+REPORT_FILE="${OUTPUT_DIR}/trivy-report.md"
 DEBUG=false
 
 # ---------- Helper: usage ----------
@@ -35,6 +36,50 @@ Options:
   -h, --help                Show this help and exit
 EOF
   exit 1
+}
+
+# Function to generate Markdown section for an image
+generate_md_section() {
+    local image="$1"
+    local json_output="$2"
+    
+    local vuln_count=$(echo "$json_output" | jq '[.Results[].Vulnerabilities[] | length] | add // 0')
+    if [[ "$vuln_count" == "0" ]]; then
+        cat << EOF
+## Image: $image
+
+No vulnerabilities detected.
+
+EOF
+        return
+    fi
+
+    local critical_count=$(echo "$json_output" | jq '[.Results[].Vulnerabilities[] | select(.Severity == "CRITICAL")] | length // 0')
+    local high_count=$(echo "$json_output" | jq '[.Results[].Vulnerabilities[] | select(.Severity == "HIGH")] | length // 0')
+    local medium_count=$(echo "$json_output" | jq '[.Results[].Vulnerabilities[] | select(.Severity == "MEDIUM")] | length // 0')
+    local low_count=$(echo "$json_output" | jq '[.Results[].Vulnerabilities[] | select(.Severity == "LOW")] | length // 0')
+
+    cat << EOF
+## Image: $image
+
+**Total vulnerabilities:** $vuln_count  
+**Critical:** $critical_count, **High:** $high_count, **Medium:** $medium_count, **Low:** $low_count
+
+| VulnerabilityID | Severity | Title | Description | PrimaryUrl |
+|-----------------|----------|-------|-------------|------------|
+EOF
+
+    echo "$json_output" | jq -r '.Results[].Vulnerabilities[]? | [
+      (.VulnerabilityID // "N/A"),
+      (.Severity // "UNKNOWN"),
+      (.Title // "No title available"),
+      (.Description // "No description available"),
+      (.PrimaryURL // "No URL available")
+    ] | @tsv' | while IFS=$'\t' read -r vid sev title desc url; do
+      echo "| $vid | $sev | $title | $desc | $url |"
+    done
+
+    echo ""
 }
 
 # ---------- Parse arguments ----------
@@ -59,7 +104,7 @@ done
 [[ ! -f "$VALUES_FILE" ]]&& { echo "Error: Values file not found: $VALUES_FILE"; exit 1; }
 
 # ---------- Ensure tools ----------
-for cmd in helm yq; do
+for cmd in helm; do
   command -v "$cmd" >/dev/null || { echo "Error: $cmd not found in PATH"; exit 1; }
 done
 
@@ -112,13 +157,42 @@ fi
 printf '%s\n' "${images[@]}" | nl
 echo "Found ${#images[@]} unique image(s)."
 
-echo $images
+# ------------------------------------------------------------
+# 3. Generate report header
+# ------------------------------------------------------------
+
+if [[ -z "$images" ]]; then
+        cat > "$REPORT_FILE" << EOF
+# Trivy Scan Report for Helm Chart
+
+No images found in the chart directory: $HELM_CHART
+EOF
+        echo "No images found. Generated empty report: $REPORT_FILE"
+        exit 0
+    fi
+    
+    echo "Found images:"
+    echo "$images"
+    
+    # Initialize Markdown report
+    cat > "$REPORT_FILE" << EOF
+# Trivy Scan Report for Helm Chart
+
+**Chart:** $HELM_CHART  
+**Values file:** $VALUES_FILE  
+*Generated on: $(date)*  
+
+Scanned images:
+EOF
+    for image in "${images[@]}"; do
+      echo "- $image" >> "$REPORT_FILE"
+    done
+    echo "" >> "$REPORT_FILE"
 
 # ------------------------------------------------------------
-# 3. Run Trivy on each image
+# 4. Run Trivy on each image
 # ------------------------------------------------------------
 for img in "${images[@]}"; do
-    set -x
     # Sanitize image name for filesystem (replace / : with _)
     safe_name=$(echo "$img" | tr '/' '_' | tr ':' '_')
     cve_file="${safe_name}_cve.json"
@@ -129,15 +203,18 @@ for img in "${images[@]}"; do
     docker pull $img
 
     # Generate SBOM
-    docker run -it -v ${OUTPUT_DIR}:/output -v /var/run/docker.sock:/var/run/docker.sock --rm aquasec/trivy:latest image --format cyclonedx --output /output/"$sbom_file" $img
+    docker run -it -v ${OUTPUT_DIR}:/output -v /var/run/docker.sock:/var/run/docker.sock -v ${TRIVY_CACHE_DIR}:/root/.cache/trivy --rm aquasec/trivy:latest image --format cyclonedx --output /output/"$sbom_file" $img
 
     # Generage CVE report; drop the --severity param if you want a full one
-    docker run -it -v ${OUTPUT_DIR}:/output -v /var/run/docker.sock:/var/run/docker.sock --rm aquasec/trivy:latest image --severity CRITICAL,HIGH --format json --output /output/"$cve_file" $img
+    docker run -it -v ${OUTPUT_DIR}:/output -v /var/run/docker.sock:/var/run/docker.sock -v ${TRIVY_CACHE_DIR}:/root/.cache/trivy --rm aquasec/trivy:latest image --severity CRITICAL,HIGH --format json --output /output/"$cve_file" $img
 
     echo "  -> CVE:  $cve_file"
     echo "  -> SBOM: $sbom_file"
 
-    docker rmi $img >/dev/null 2>&1 || true
+    # Append to Markdown report
+    generate_md_section "$img" "$(cat ${OUTPUT_DIR}/$cve_file)" >> "$REPORT_FILE"
+
+    # docker rmi $img >/dev/null 2>&1 || true
 done
 
 echo "All done! Reports are in $OUTPUT_DIR"
