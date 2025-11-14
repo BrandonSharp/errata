@@ -21,6 +21,7 @@ TRIVY_CACHE_DIR="${HOME}/.cache/trivy"
 REPORT_FILE="${OUTPUT_DIR}/trivy-report.md"
 DEBUG=false
 CLEANUP=true
+GENERATE_SBOM_REPORTS=false
 
 # ---------- Helper: usage ----------
 usage() {
@@ -34,6 +35,9 @@ Options:
   -n, --namespace <ns>      Kubernetes namespace (default: $NAMESPACE)
   -o, --output <dir>        Directory for Trivy JSON reports (default: $OUTPUT_DIR)
   -C, --cache <dir>         Trivy cache directory (default: $TRIVY_CACHE_DIR)
+  -d, --debug               Enable debug output
+  -k, --keep-images         Do not remove pulled images after scanning
+  -s, --sbom-reports        Generate SBOM summary reports after scanning
   -h, --help                Show this help and exit
 EOF
   exit 1
@@ -44,7 +48,7 @@ generate_md_section() {
     local image="$1"
     local json_output="$2"
     
-    local vuln_count=$(echo "$json_output" | jq '[.Results[].Vulnerabilities[] | length] | add // 0')
+    local vuln_count=$(echo "$json_output" | jq '[.Results[].Vulnerabilities[]? // [] | length] | add // 0')
     if [[ "$vuln_count" == "0" ]]; then
         cat << EOF
 ## Image: $image
@@ -55,10 +59,10 @@ EOF
         return
     fi
 
-    local critical_count=$(echo "$json_output" | jq '[.Results[].Vulnerabilities[] | select(.Severity == "CRITICAL")] | length // 0')
-    local high_count=$(echo "$json_output" | jq '[.Results[].Vulnerabilities[] | select(.Severity == "HIGH")] | length // 0')
-    local medium_count=$(echo "$json_output" | jq '[.Results[].Vulnerabilities[] | select(.Severity == "MEDIUM")] | length // 0')
-    local low_count=$(echo "$json_output" | jq '[.Results[].Vulnerabilities[] | select(.Severity == "LOW")] | length // 0')
+    local critical_count=$(echo "$json_output" | jq '[.Results[].Vulnerabilities[]? | select(.Severity == "CRITICAL")] | length // 0')
+    local high_count=$(echo "$json_output" | jq '[.Results[].Vulnerabilities[]? | select(.Severity == "HIGH")] | length // 0')
+    local medium_count=$(echo "$json_output" | jq '[.Results[].Vulnerabilities[]? | select(.Severity == "MEDIUM")] | length // 0')
+    local low_count=$(echo "$json_output" | jq '[.Results[].Vulnerabilities[]? | select(.Severity == "LOW")] | length // 0')
 
     cat << EOF
 ## Image: $image
@@ -86,14 +90,15 @@ EOF
 # ---------- Parse arguments ----------
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    -c|--chart)          HELM_CHART="$2";      shift 2 ;;
-    -v|--values)         VALUES_FILE="$2";     shift 2 ;;
-    -r|--release)        RELEASE_NAME="$2";    shift 2 ;;
-    -n|--namespace)      NAMESPACE="$2";       shift 2 ;;
-    -o|--output)         OUTPUT_DIR="$2";      shift 2 ;;
-    -C|--cache)          TRIVY_CACHE_DIR="$2"; shift 2 ;;
-    -d|--debug)          DEBUG=true;           shift 1 ;;
-    -k|--keep-images)    CLEANUP=false;        shift 1 ;;
+    -c|--chart)          HELM_CHART="$2";            shift 2 ;;
+    -v|--values)         VALUES_FILE="$2";           shift 2 ;;
+    -r|--release)        RELEASE_NAME="$2";          shift 2 ;;
+    -n|--namespace)      NAMESPACE="$2";             shift 2 ;;
+    -o|--output)         OUTPUT_DIR="$2";            shift 2 ;;
+    -C|--cache)          TRIVY_CACHE_DIR="$2";       shift 2 ;;
+    -d|--debug)          DEBUG=true;                 shift 1 ;;
+    -k|--keep-images)    CLEANUP=false;              shift 1 ;;
+    -s|--sbom-reports)   GENERATE_SBOM_REPORTS=true; shift 1 ;;
     -h|--help)           usage ;;
     *) echo "Unknown option: $1"; usage ;;
   esac
@@ -220,6 +225,11 @@ for img in "${images[@]}"; do
         docker rmi $img >/dev/null 2>&1 || true
     fi
 done
+
+if [[ "$GENERATE_SBOM_REPORTS" == true ]]; then
+    echo "Generating SBOM summary reports..."
+    ./generate-sbom-summary-reports.sh "$OUTPUT_DIR"
+fi
 
 echo "All done! Reports are in $OUTPUT_DIR"
 
