@@ -20,6 +20,7 @@ OUTPUT_DIR="./trivy-reports"
 TRIVY_CACHE_DIR="${HOME}/.cache/trivy"
 REPORT_FILE="${OUTPUT_DIR}/trivy-report.md"
 DEBUG=false
+CLEANUP=true
 
 # ---------- Helper: usage ----------
 usage() {
@@ -85,14 +86,15 @@ EOF
 # ---------- Parse arguments ----------
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    -c|--chart)      HELM_CHART="$2";      shift 2 ;;
-    -v|--values)     VALUES_FILE="$2";     shift 2 ;;
-    -r|--release)    RELEASE_NAME="$2";    shift 2 ;;
-    -n|--namespace)  NAMESPACE="$2";       shift 2 ;;
-    -o|--output)     OUTPUT_DIR="$2";      shift 2 ;;
-    -C|--cache)      TRIVY_CACHE_DIR="$2"; shift 2 ;;
-    -d|--debug)      DEBUG=true;           shift 1 ;;
-    -h|--help)       usage ;;
+    -c|--chart)          HELM_CHART="$2";      shift 2 ;;
+    -v|--values)         VALUES_FILE="$2";     shift 2 ;;
+    -r|--release)        RELEASE_NAME="$2";    shift 2 ;;
+    -n|--namespace)      NAMESPACE="$2";       shift 2 ;;
+    -o|--output)         OUTPUT_DIR="$2";      shift 2 ;;
+    -C|--cache)          TRIVY_CACHE_DIR="$2"; shift 2 ;;
+    -d|--debug)          DEBUG=true;           shift 1 ;;
+    -k|--keep-images)    CLEANUP=false;        shift 1 ;;
+    -h|--help)           usage ;;
     *) echo "Unknown option: $1"; usage ;;
   esac
 done
@@ -214,7 +216,9 @@ for img in "${images[@]}"; do
     # Append to Markdown report
     generate_md_section "$img" "$(cat ${OUTPUT_DIR}/$cve_file)" >> "$REPORT_FILE"
 
-    # docker rmi $img >/dev/null 2>&1 || true
+    if [[ "$CLEANUP" == true ]]; then
+        docker rmi $img >/dev/null 2>&1 || true
+    fi
 done
 
 echo "All done! Reports are in $OUTPUT_DIR"
