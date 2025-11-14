@@ -1,0 +1,2 @@
+# exclude a scratch directory named .local
+.local
