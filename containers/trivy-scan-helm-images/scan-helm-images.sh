@@ -48,7 +48,7 @@ generate_md_section() {
     local image="$1"
     local json_output="$2"
     
-    local vuln_count=$(echo "$json_output" | jq '[.Results[].Vulnerabilities[]? // [] | length] | add // 0')
+    local vuln_count=$(echo "$json_output" | jq '[.Results[].Vulnerabilities? // [] | length] | add // 0')
     if [[ "$vuln_count" == "0" ]]; then
         cat << EOF
 ## Image: $image
