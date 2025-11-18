@@ -1,235 +1,190 @@
 #!/usr/bin/env bash
-# ------------------------------------------------------------
-# scan-helm-images.sh
-# Render a Helm chart, extract every container image,
-# and generate Trivy CVE + SBOM JSON files (one pair per image).
-#
-# Usage examples:
-#   ./scan-helm-images.sh --chart ./mychart --values ./values.yaml
-#   ./scan-helm-images.sh -c ./mychart -v ./values.yaml -r myrel -n default -o ./reports
-# ------------------------------------------------------------
+# generate-sbom-summary.sh
+#   $1  – directory that contains the *_sbom.json files
+#   Output:
+#       version-conflicts.md  – components with version conflicts
+#       inventory.md          – full component inventory by type
 
 set -euo pipefail
 
-# ---------- Default values ----------
-HELM_CHART=""
-VALUES_FILE=""
-RELEASE_NAME="myrelease"
-NAMESPACE="default"
-OUTPUT_DIR="./trivy-reports"
-TRIVY_CACHE_DIR="${HOME}/.cache/trivy"
-REPORT_FILE="${OUTPUT_DIR}/trivy-report.md"
-DEBUG=false
-CLEANUP=true
-GENERATE_SBOM_REPORTS=false
-
-# ---------- Helper: usage ----------
+# -------------------------------------------------------------------------
+# Helper
+# -------------------------------------------------------------------------
 usage() {
-  cat <<EOF
-Usage: $0 [OPTIONS]
+    cat <<'EOF'
+Usage: $0 <directory>
 
-Options:
-  -c, --chart <path>        Path to the Helm chart directory (required)
-  -v, --values <file>       Path to values.yaml (required)
-  -r, --release <name>      Release name for helm template (default: $RELEASE_NAME)
-  -n, --namespace <ns>      Kubernetes namespace (default: $NAMESPACE)
-  -o, --output <dir>        Directory for Trivy JSON reports (default: $OUTPUT_DIR)
-  -C, --cache <dir>         Trivy cache directory (default: $TRIVY_CACHE_DIR)
-  -d, --debug               Enable debug output
-  -k, --keep-images         Do not remove pulled images after scanning
-  -s, --sbom-reports        Generate SBOM summary reports after scanning
-  -h, --help                Show this help and exit
+  <directory>  Path to a folder that contains CycloneDX SBOM files
+               (files must end with "_sbom.json").
 EOF
-  exit 1
+    exit 1
 }
 
-# Function to generate Markdown section for an image
-generate_md_section() {
-    local image="$1"
-    local json_output="$2"
-    
-    local vuln_count=$(echo "$json_output" | jq '[.Results[].Vulnerabilities[]? // [] | length] | add // 0')
-    if [[ "$vuln_count" == "0" ]]; then
-        cat << EOF
-## Image: $image
+# -------------------------------------------------------------------------
+# Argument check
+# -------------------------------------------------------------------------
+if [[ $# -ne 1 ]] || [[ ! -d "$1" ]]; then
+    echo "Error: please supply a valid directory." >&2
+    usage
+fi
 
-No vulnerabilities detected.
+DIR="$(realpath "$1")"
+CONFLICTS_OUT="$DIR/version-conflicts.md"
+INVENTORY_OUT="$DIR/inventory.md"
 
-EOF
-        return
-    fi
+# -------------------------------------------------------------------------
+# Secure temporary files
+# -------------------------------------------------------------------------
+TEMP_COMPONENTS=$(mktemp) || exit 1
+TEMP_SORTED=$(mktemp)     || exit 1
+trap 'rm -f "$TEMP_COMPONENTS" "$TEMP_SORTED"' EXIT
 
-    local critical_count=$(echo "$json_output" | jq '[.Results[].Vulnerabilities[]? | select(.Severity == "CRITICAL")] | length // 0')
-    local high_count=$(echo "$json_output" | jq '[.Results[].Vulnerabilities[]? | select(.Severity == "HIGH")] | length // 0')
-    local medium_count=$(echo "$json_output" | jq '[.Results[].Vulnerabilities[]? | select(.Severity == "MEDIUM")] | length // 0')
-    local low_count=$(echo "$json_output" | jq '[.Results[].Vulnerabilities[]? | select(.Severity == "LOW")] | length // 0')
+# -------------------------------------------------------------------------
+# 1. Gather raw data: type|name|version|image
+# -------------------------------------------------------------------------
+> "$TEMP_COMPONENTS"
 
-    cat << EOF
-## Image: $image
+find "$DIR" -type f -name '*_sbom.json' -print0 |
+while IFS= read -r -d '' file; do
+    image=$(jq -r '.metadata.component.name // .metadata.component."bom-ref" // "unknown"' "$file")
+    jq -e '.components // empty' "$file" >/dev/null || continue
 
-**Total vulnerabilities:** $vuln_count  
-**Critical:** $critical_count, **High:** $high_count, **Medium:** $medium_count, **Low:** $low_count
+    jq -r --arg img "$image" '
+        .components[] |
+        [
+            (.type // "unknown"),
+            (.name // "unknown"),
+            (.version // "unknown"),
+            $img
+        ] | join("|")
+    ' "$file" >> "$TEMP_COMPONENTS"
+done
 
-| VulnerabilityID | Severity | Title | Description | PrimaryUrl |
-|-----------------|----------|-------|-------------|------------|
-EOF
+# -------------------------------------------------------------------------
+# 2. Deduplicate + sort
+# -------------------------------------------------------------------------
+sort "$TEMP_COMPONENTS" | uniq > "$TEMP_SORTED"
 
-    echo "$json_output" | jq -r '.Results[].Vulnerabilities[]? | [
-      (.VulnerabilityID // "N/A"),
-      (.Severity // "UNKNOWN"),
-      (.Title // "No title available"),
-      (.Description // "No description available"),
-      (.PrimaryURL // "No URL available")
-    ] | @tsv' | while IFS=$'\t' read -r vid sev title desc url; do
-      echo "| $vid | $sev | $title | $desc | $url |"
-    done
+# -------------------------------------------------------------------------
+# 3. Generate BOTH reports in one awk pass
+# -------------------------------------------------------------------------
+awk -F'|' \
+    -v conflicts_out="$CONFLICTS_OUT" \
+    -v inventory_out="$INVENTORY_OUT" \
+    -v srcdir="$DIR" \
+'
+BEGIN {
+    # Header for conflicts
+    printf "# Version Conflicts Report\n\n_Generated from SBOMs in: %s_\n\n", srcdir > conflicts_out
+    printf "_Components that appear with **multiple versions** across images._\n\n" >> conflicts_out
 
-    echo ""
+    # Header for inventory
+    printf "# Component Inventory\n\n_Generated from SBOMs in: %s_\n\n", srcdir > inventory_out
 }
+{
+    typ   = $1
+    name  = $2
+    ver   = $3
+    img   = $4
+    key   = name " @" ver
 
-# ---------- Parse arguments ----------
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    -c|--chart)          HELM_CHART="$2";            shift 2 ;;
-    -v|--values)         VALUES_FILE="$2";           shift 2 ;;
-    -r|--release)        RELEASE_NAME="$2";          shift 2 ;;
-    -n|--namespace)      NAMESPACE="$2";             shift 2 ;;
-    -o|--output)         OUTPUT_DIR="$2";            shift 2 ;;
-    -C|--cache)          TRIVY_CACHE_DIR="$2";       shift 2 ;;
-    -d|--debug)          DEBUG=true;                 shift 1 ;;
-    -k|--keep-images)    CLEANUP=false;              shift 1 ;;
-    -s|--sbom-reports)   GENERATE_SBOM_REPORTS=true; shift 1 ;;
-    -h|--help)           usage ;;
-    *) echo "Unknown option: $1"; usage ;;
-  esac
-done
+    # Full inventory
+    types[typ][key][img] = 1
 
-# ---------- Validate required args ----------
-[[ -z "$HELM_CHART" ]]   && { echo "Error: --chart is required";   usage; }
-[[ -z "$VALUES_FILE" ]]  && { echo "Error: --values is required";  usage; }
-[[ ! -d "$HELM_CHART" ]] && { echo "Error: Chart directory not found: $HELM_CHART"; exit 1; }
-[[ ! -f "$VALUES_FILE" ]]&& { echo "Error: Values file not found: $VALUES_FILE"; exit 1; }
+    # Conflict detection (name-based, ignore type)
+    all[name][ver][img] = 1
+}
+END {
+    # ------------------------------------------------------------------
+    # 1. VERSION CONFLICTS → version-conflicts.md
+    # ------------------------------------------------------------------
+    conflict_count = 0
+    for (n in all) {
+        ver_cnt = 0
+        for (v in all[n]) ver_arr[++ver_cnt] = v
+        if (ver_cnt > 1) {
+            conflict_names[++conflict_count] = n
 
-# ---------- Ensure tools ----------
-for cmd in helm; do
-  command -v "$cmd" >/dev/null || { echo "Error: $cmd not found in PATH"; exit 1; }
-done
+            # Build pipe-separated version list
+            vers_str = ""
+            for (v in all[n]) {
+                vers_str = (vers_str == "" ? v : vers_str "|" v)
+            }
+            conflict_data[n] = vers_str
+        }
+    }
 
-mkdir -p "$OUTPUT_DIR"
+    if (conflict_count > 0) {
+        asort(conflict_names)
+        for (i = 1; i <= conflict_count; i++) {
+            n = conflict_names[i]
+            split(conflict_data[n], ver_arr, "|")
 
+            # Find newest version (lexical)
+            newest = ""
+            for (j = 1; j in ver_arr; j++) {
+                v = ver_arr[j]
+                if (newest == "" || v > newest) newest = v
+            }
 
-# ------------------------------------------------------------
-# 1. Render Helm chart
-# ------------------------------------------------------------
-echo "Rendering Helm chart..."
-rendered_yaml=$(helm template "$RELEASE_NAME" "$HELM_CHART" \
-    --values "$VALUES_FILE" \
-    --namespace "$NAMESPACE")
+            printf "- **%s** – *latest: `%s`*\n", n, newest >> conflicts_out
 
-# ------------------------------------------------------------
-# 2. Extract images
-# ------------------------------------------------------------
-echo "Extracting container images..."
-mapfile -t images < <(
-  echo "$rendered_yaml" |
-  grep -E '^[[:space:]]+image:' |
-  awk -F 'image:' '{
-    gsub(/^[ \t]+|[ \t]+$/, "", $2);  # trim whitespace
-    gsub(/^["'"'"']|["'"'"']$/, "", $2);  # strip leading/trailing " or '"'"'
-    print $2
-  }' |
-  grep -E '.+/.+[:@].*' |
-  sort -u
-)
+            for (j = 1; j in ver_arr; j++) {
+                v = ver_arr[j]
+                printf "  - **%s**\n", v >> conflicts_out
 
-if [[ "$DEBUG" == true ]]; then
-  echo "DEBUG: Raw image lines:"
-  echo "$rendered_yaml" | grep -E '^[[:space:]]+image:' | head -10
-  echo "DEBUG: After awk + sed:"
-  echo "$rendered_yaml" | grep -E '^[[:space:]]+image:' | awk -F 'image:' '{print $2}' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | head -5
-  echo "DEBUG: After final grep (should match all real images):"
-  echo "$rendered_yaml" | grep -E '^[[:space:]]+image:' | awk -F 'image:' '{print $2}' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | grep -E '.+/.+[:@].*' | head -5
-fi
+                delete img_arr; img_cnt = 0
+                for (im in all[n][v]) img_arr[++img_cnt] = im
+                asort(img_arr)
+                for (q = 1; q <= img_cnt; q++) {
+                    printf "    - %s\n", img_arr[q] >> conflicts_out
+                }
+            }
+            print "" >> conflicts_out
+        }
+    } else {
+        print "*No version conflicts found.*" >> conflicts_out
+    }
 
-if (( ${#images[@]} == 0 )); then
-  echo "Still no images? Possible causes:"
-  echo "  • images are quoted: image: \"nginx:latest\""
-  echo "  • images are in Helm comments or hooks"
-  echo "  • chart uses .Values.image but no containers"
-  echo ""
-  echo "Try: grep -n 'image:' /tmp/rendered.yaml"
-  exit 1
-fi
+    # ------------------------------------------------------------------
+    # 2. FULL INVENTORY → inventory.md
+    # ------------------------------------------------------------------
+    type_cnt = 0
+    for (t in types) type_arr[++type_cnt] = t
+    asort(type_arr)
 
-printf '%s\n' "${images[@]}" | nl
-echo "Found ${#images[@]} unique image(s)."
+    for (i = 1; i <= type_cnt; i++) {
+        t = type_arr[i]
+        printf "## %s\n\n", t >> inventory_out
 
-# ------------------------------------------------------------
-# 3. Generate report header
-# ------------------------------------------------------------
+        delete comp_arr; comp_cnt = 0
+        for (k in types[t]) comp_arr[++comp_cnt] = k
+        asort(comp_arr)
 
-if [[ -z "$images" ]]; then
-        cat > "$REPORT_FILE" << EOF
-# Trivy Scan Report for Helm Chart
+        for (j = 1; j <= comp_cnt; j++) {
+            k = comp_arr[j]
+            printf "- **%s**\n", k >> inventory_out
 
-No images found in the chart directory: $HELM_CHART
-EOF
-        echo "No images found. Generated empty report: $REPORT_FILE"
-        exit 0
-    fi
-    
-    echo "Found images:"
-    echo "$images"
-    
-    # Initialize Markdown report
-    cat > "$REPORT_FILE" << EOF
-# Trivy Scan Report for Helm Chart
+            delete img_arr; img_cnt = 0
+            for (im in types[t][k]) img_arr[++img_cnt] = im
+            asort(img_arr)
 
-**Chart:** $HELM_CHART  
-**Values file:** $VALUES_FILE  
-*Generated on: $(date)*  
+            for (q = 1; q <= img_cnt; q++) {
+                printf "  - %s\n", img_arr[q] >> inventory_out
+            }
+            print "" >> inventory_out
+        }
+        print "" >> inventory_out
+    }
 
-Scanned images:
-EOF
-    for image in "${images[@]}"; do
-      echo "- $image" >> "$REPORT_FILE"
-    done
-    echo "" >> "$REPORT_FILE"
+    # Final message
+    printf "\n**%d component type(s) scanned.**\n", type_cnt >> inventory_out
+}
+' "$TEMP_SORTED"
 
-# ------------------------------------------------------------
-# 4. Run Trivy on each image
-# ------------------------------------------------------------
-for img in "${images[@]}"; do
-    # Sanitize image name for filesystem (replace / : with _)
-    safe_name=$(echo "$img" | tr '/' '_' | tr ':' '_')
-    cve_file="${safe_name}_cve.json"
-    sbom_file="${safe_name}_sbom.json"
-
-    echo "Scanning $img ..."
-
-    docker pull $img
-
-    # Generate SBOM
-    docker run -it -v ${OUTPUT_DIR}:/output -v /var/run/docker.sock:/var/run/docker.sock -v ${TRIVY_CACHE_DIR}:/root/.cache/trivy --rm aquasec/trivy:latest image --format cyclonedx --output /output/"$sbom_file" $img
-
-    # Generage CVE report; drop the --severity param if you want a full one
-    docker run -it -v ${OUTPUT_DIR}:/output -v /var/run/docker.sock:/var/run/docker.sock -v ${TRIVY_CACHE_DIR}:/root/.cache/trivy --rm aquasec/trivy:latest image --severity CRITICAL,HIGH --format json --output /output/"$cve_file" $img
-
-    echo "  -> CVE:  $cve_file"
-    echo "  -> SBOM: $sbom_file"
-
-    # Append to Markdown report
-    generate_md_section "$img" "$(cat ${OUTPUT_DIR}/$cve_file)" >> "$REPORT_FILE"
-
-    if [[ "$CLEANUP" == true ]]; then
-        docker rmi $img >/dev/null 2>&1 || true
-    fi
-done
-
-if [[ "$GENERATE_SBOM_REPORTS" == true ]]; then
-  echo "Generating SBOM summary reports..."
-  "$(dirname "$0")/generate-sbom-summary-reports.sh" "$OUTPUT_DIR"
-fi
-
-echo "All done! Reports are in $OUTPUT_DIR"
-
+# -------------------------------------------------------------------------
+# Done
+# -------------------------------------------------------------------------
+echo "Reports generated:"
+echo "   Version Conflicts: $CONFLICTS_OUT"
+echo "   Full Inventory:    $INVENTORY_OUT"
