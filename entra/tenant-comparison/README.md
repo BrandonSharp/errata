@@ -1,0 +1,3 @@
+# Entra Tenant User Comparison
+
+We manage several different tenants and needed a quick and easy way to find users in downstream tenants that are no longer in the source, either because of offboarding or job changes. This script helps identity these uses quickly by allowing you to login to your tenants and perform a quick MS Graph query to grab user names. These are then compared against the destination tenants and a report is generated to highlight any users that might have accounts in the secondary tenants, but not the first.
