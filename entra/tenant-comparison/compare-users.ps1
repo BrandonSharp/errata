@@ -6,6 +6,7 @@ $ErrorActionPreference = 'Stop'
 $sourceTenant = ''
 $sourceCloud = 'AzureCloud'
 $sourceAccount = ''
+$skipLogin = $false
 $outputFile = "tenant-user-sync-report_{0}.md" -f (Get-Date -Format 'yyyyMMdd_HHmmss')
 $secondaries = [System.Collections.Generic.List[string]]::new()
 
@@ -23,6 +24,7 @@ Required:
 Options:
       --source-cloud <name>      Source Azure cloud (default: $sourceCloud)
       --source-account <name>    Account to use when logging into the source tenant
+      --skip-login               Skip az login and use the existing Azure CLI session
   -o, --output <file>            Markdown report path (default: $outputFile)
   -h, --help                     Show this help
 
@@ -103,6 +105,10 @@ function Invoke-AzLogin {
         Stop-WithError "Unable to select Azure cloud '$Cloud'."
     }
 
+    if ($script:skipLogin) {
+        return
+    }
+
     $loginArguments = @('login', '--tenant', $Tenant, '--allow-no-subscriptions', '--only-show-errors', '--output', 'none')
     if ($Account) {
         $loginArguments += @('--username', $Account)
@@ -176,6 +182,10 @@ for ($index = 0; $index -lt $arguments.Count; $index++) {
         '--source-account' {
             if ($index + 1 -ge $arguments.Count) { Stop-WithError "$option requires a value" }
             $sourceAccount = $arguments[++$index]
+            continue
+        }
+        '--skip-login' {
+            $skipLogin = $true
             continue
         }
         { $_ -in '-t', '--secondary' } {

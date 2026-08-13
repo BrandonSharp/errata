@@ -5,6 +5,7 @@ set -euo pipefail
 SOURCE_TENANT=""
 SOURCE_CLOUD="AzureCloud"
 SOURCE_ACCOUNT=""
+SKIP_LOGIN=false
 OUTPUT_FILE="tenant-user-sync-report_$(date +%Y%m%d_%H%M%S).md"
 SECONDARIES=()
 
@@ -22,6 +23,7 @@ Required:
 Options:
 			--source-cloud <name>      Source Azure cloud (default: AzureCloud)
 			--source-account <name>    Account to use when logging into the source tenant
+		--skip-login                Skip az login and use the existing Azure CLI session
 	-o, --output <file>            Markdown report path (default: $OUTPUT_FILE)
 	-h, --help                     Show this help
 
@@ -55,8 +57,10 @@ login_to_tenant() {
 	echo "Logging into tenant '$tenant' in cloud '$cloud'..." >&2
 	az cloud set --name "$cloud"
 	if [[ -n "$account" ]]; then
+		[[ "$SKIP_LOGIN" == true ]] && return
 		az login --tenant "$tenant" --username "$account" --allow-no-subscriptions --output none
 	else
+		[[ "$SKIP_LOGIN" == true ]] && return
 		az login --tenant "$tenant" --allow-no-subscriptions --output none
 	fi
 }
@@ -104,6 +108,10 @@ while [[ $# -gt 0 ]]; do
 			[[ $# -ge 2 ]] || error "$1 requires a value"
 			SOURCE_ACCOUNT="$2"
 			shift 2
+			;;
+		--skip-login)
+			SKIP_LOGIN=true
+			shift
 			;;
 		-t|--secondary)
 			[[ $# -ge 2 ]] || error "$1 requires a value"
